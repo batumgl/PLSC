@@ -16,7 +16,7 @@ import paddle
 
 from .base_model import BaseModel
 
-__all__ = ["ResNet", "ResNet50", "ResNet101", "ResNet152"]
+__all__ = ["ResNet", "ResNet50", "ResNet100", "ResNet101", "ResNet152"]
 
 
 class ResNet(BaseModel):
@@ -27,13 +27,15 @@ class ResNet(BaseModel):
 
     def build_network(self, input, is_train=True):
         layers = self.layers
-        supported_layers = [50, 101, 152]
+        supported_layers = [50, 100, 101, 152]
         assert layers in supported_layers, \
             "supported layers {}, but given {}".format(supported_layers, layers)
 
         depth = None
         if layers == 50:
             depth = [3, 4, 14, 3]
+        elif layers == 100:
+            depth = [3, 13, 30, 3]
         elif layers == 101:
             depth = [3, 4, 23, 3]
         elif layers == 152:
@@ -179,6 +181,11 @@ class ResNet(BaseModel):
 
 def ResNet50(emb_dim=512):
     model = ResNet(layers=50, emb_dim=emb_dim)
+    return model
+
+
+def ResNet100(emb_dim=512):
+    model = ResNet(layers=100, emb_dim=emb_dim)
     return model
 
 

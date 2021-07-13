@@ -58,25 +58,6 @@ class Entry(object):
     The class to encapsulate all operations.
     """
 
-    def _check(self):
-        """
-        Check the validation of parameters.
-        """
-        supported_types = [
-            "softmax",
-            "arcface",
-            "dist_softmax",
-            "dist_arcface",
-        ]
-        assert self.loss_type in supported_types, \
-            "All supported types are {}, but given {}.".format(
-             supported_types, self.loss_type)
-
-        if self.loss_type in ["dist_softmax", "dist_arcface"]:
-            assert self.num_trainers > 1, \
-                "At least 2 trainers are required for distributed fc-layer. " \
-                "You can start your job using paddle.distributed.launch module."
-
     def __init__(self):
         self.config = config.config
         super(Entry, self).__init__()
@@ -118,8 +99,12 @@ class Entry(object):
         self.val_targets = self.config.val_targets
         self.dataset_dir = self.config.dataset_dir
         self.num_classes = self.config.num_classes
+        self.sample_ratio = self.config.sample_ratio
+        self.model_parallel = self.config.model_parallel
         self.loss_type = self.config.loss_type
-        self.margin = self.config.margin
+        self.margin1 = self.config.margin1
+        self.margin2 = self.config.margin2
+        self.margin3 = self.config.margin3
         self.scale = self.config.scale
         self.lr = self.config.lr
         self.lr_steps = self.config.lr_steps
@@ -128,11 +113,15 @@ class Entry(object):
         self.model_name = self.config.model_name
         self.emb_dim = self.config.emb_dim
         self.train_epochs = self.config.train_epochs
+        self.train_steps = self.config.train_steps
         self.checkpoint_dir = self.config.checkpoint_dir
         self.with_test = self.config.with_test
         self.model_save_dir = self.config.model_save_dir
         self.warmup_epochs = self.config.warmup_epochs
         self.calc_train_acc = False
+
+        assert not (self.train_epochs and self.train_steps
+                    ), 'train_steps and train_epochs only one can be set'
 
         self.max_last_checkpoint_num = 5
         if self.checkpoint_dir:
@@ -166,10 +155,19 @@ class Entry(object):
             logger.info('\t' + str(key) + ": " + str(self.config[key]))
         logger.info('trainer_id: {}, num_trainers: {}'.format(trainer_id,
                                                               num_trainers))
+        logger.info('global_train_batch_size: {}'.format(
+            self.global_train_batch_size))
         logger.info('default lr_decay_factor: {}'.format(self.lr_decay_factor))
         logger.info('default log period: {}'.format(self.log_period))
         logger.info('default test period: {}'.format(self.test_period))
         logger.info('=' * 30)
+
+    def set_model_name(self, model_name):
+        """
+        Set model name, eg. "ResNet50", "ResNet101"
+        """
+        self.model_name = model_name
+        logger.info("Set model_name to {}.".format(model_name))
 
     def set_use_quant(self, quant):
         """
@@ -212,8 +210,9 @@ class Entry(object):
     def set_train_batch_size(self, batch_size):
         self.train_batch_size = batch_size
         self.global_train_batch_size = batch_size * self.num_trainers
-        logger.info("Set train batch size per trainer to {}.".format(
-            batch_size))
+        logger.info("Set train batch size per trainer to {}, global "
+                    "train batch size to {}.".format(
+                        batch_size, self.global_train_batch_size))
 
     def set_log_period(self, period):
         self.log_period = period
@@ -228,8 +227,8 @@ class Entry(object):
         logger.info("Set lr decay factor to {}.".format(factor))
 
     def set_step_boundaries(self, boundaries):
-        if not isinstance(boundaries, list):
-            raise ValueError("The parameter must be of type list.")
+        if not isinstance(boundaries, (tuple, list)):
+            raise ValueError("The parameter must be of type tuple or list.")
         self.lr_steps = boundaries
         logger.info("Set step boundaries to {}.".format(boundaries))
 
@@ -327,6 +326,23 @@ class Entry(object):
         self.num_classes = num
         logger.info("Set num_classes to {}.".format(num))
 
+    def set_model_parallel(self, flag):
+        """
+        Set the flag of model parallel.
+        """
+        self.model_parallel = flag
+        if flag:
+            assert self.num_trainers > 1, "The number of GPUs must greater " \
+                "than 1 when using model parallel training"
+        logger.info("Set model_parallel to {}.".format(flag))
+
+    def set_sample_ratio(self, sample_ratio):
+        """
+        Set the sample ratio of Partial FC.
+        """
+        self.sample_ratio = sample_ratio
+        logger.info("Set sample_ratio to {}.".format(sample_ratio))
+
     def set_emb_size(self, size):
         """
         Set the size of the last hidding layer before the distributed fc-layer.
@@ -348,8 +364,17 @@ class Entry(object):
         """
         Set the number of epochs to train.
         """
+        self.train_steps = None
         self.train_epochs = num
         logger.info("Set train_epochs to {}.".format(num))
+
+    def set_train_steps(self, num):
+        """
+        Set the number of steps to train.
+        """
+        self.train_epochs = None
+        self.train_steps = num
+        logger.info("Set train_steps to {}.".format(num))
 
     def set_checkpoint_dir(self, directory):
         """
@@ -371,15 +396,39 @@ class Entry(object):
         self.warmup_epochs = num
         logger.info("Set warmup_epochs to {}.".format(num))
 
-    def set_loss_type(self, loss_type):
-        supported_types = [
-            "dist_softmax", "dist_arcface", "softmax", "arcface"
-        ]
-        if loss_type not in supported_types:
-            raise ValueError("All supported loss types: {}".format(
-                supported_types))
+    def set_loss_type(self,
+                      loss_type,
+                      margin1=None,
+                      margin2=None,
+                      margin3=None):
+        """
+        Set the loss type. Supported arcface, cosface, sphereface loss type.
+        You also can set combined margin loss by yourself via marign1, margin2, maring3.
+        """
         self.loss_type = loss_type
-        logger.info("Set loss_type to {}.".format(loss_type))
+        if "arcface" == loss_type:
+            self.margin1 = 1.0 if margin1 is None else margin1
+            self.margin2 = 0.5 if margin2 is None else margin2
+            self.margin3 = 0.0 if margin3 is None else margin3
+        elif "cosface" == loss_type:
+            self.margin1 = 1.0 if margin1 is None else margin1
+            self.margin2 = 0.0 if margin2 is None else margin2
+            self.margin3 = 0.35 if margin3 is None else margin3
+        elif "sphereface" == loss_type:
+            self.margin1 = 1.35 if margin1 is None else margin1
+            self.margin2 = 0.0 if margin2 is None else margin2
+            self.margin3 = 0.0 if margin3 is None else margin3
+        else:
+            self.margin1 = margin1
+            self.margin2 = margin2
+            self.margin3 = margin3
+        assert self.margin1 is not None, "margin1 must be set"
+        assert self.margin2 is not None, "margin2 must be set"
+        assert self.margin3 is not None, "margin3 must be set"
+
+        logger.info(
+            "Set loss_type to {}, margin1 = {}, margin2 = {}, margin3 = {}.".
+            format(loss_type, self.margin1, self.margin2, self.margin3))
 
     def set_optimizer(self, optimizer):
         if not isinstance(optimizer, Optimizer):
@@ -421,6 +470,8 @@ class Entry(object):
             steps_per_pass = int(
                 math.ceil(images_per_trainer * 1.0 / self.train_batch_size))
             logger.info("Steps per epoch: %d" % steps_per_pass)
+            if self.train_epochs is None:
+                self.train_epochs = self.train_steps // steps_per_pass + 1
             warmup_steps = steps_per_pass * self.warmup_epochs
             batch_denom = 1024
             base_lr = start_lr * global_batch_size / batch_denom
@@ -445,12 +496,11 @@ class Entry(object):
                 weight_decay=paddle.regularizer.L2Decay(5e-4))
             self.optimizer = optimizer
 
-        if self.loss_type in ["dist_softmax", "dist_arcface"]:
+        if self.model_parallel:
             self.optimizer = DistributedClassificationOptimizer(
                 self.optimizer,
                 self.train_batch_size,
                 use_fp16=self.use_fp16,
-                loss_type=self.loss_type,
                 fp16_user_dict=self.fp16_user_dict)
         elif self.use_fp16:
             self.optimizer = paddle.static.amp.decorate(
@@ -486,23 +536,32 @@ class Entry(object):
                 input_field.build()
                 self.input_field = input_field
 
+                if self.model_parallel:
+                    msg = 'Using model parallelism for training.'
+                    logger.info(msg)
+                if self.sample_ratio < 1.0:
+                    msg = 'Using Partial FC and sample ratio = %.2f.' % self.sample_ratio
+                    logger.info(msg)
                 emb, loss, prob = model.get_output(
                     input=input_field,
                     num_classes=self.num_classes,
                     num_ranks=num_trainers,
                     rank_id=trainer_id,
+                    model_parallel=self.model_parallel,
                     is_train=is_train,
                     param_attr=self.param_attr,
                     bias_attr=self.bias_attr,
-                    loss_type=self.loss_type,
-                    margin=self.margin,
-                    scale=self.scale)
+                    margin1=self.margin1,
+                    margin2=self.margin2,
+                    margin3=self.margin3,
+                    scale=self.scale,
+                    sample_ratio=self.sample_ratio)
 
                 acc1 = None
                 acc5 = None
 
-                if self.loss_type in ["dist_softmax", "dist_arcface"]:
-                    if self.calc_train_acc:
+                if self.calc_train_acc:
+                    if self.model_parallel:
                         shard_prob = loss._get_info("shard_prob")
 
                         prob_list = []
@@ -520,8 +579,7 @@ class Entry(object):
                             input=prob,
                             label=paddle.reshape(label_all, (-1, 1)),
                             k=5)
-                else:
-                    if self.calc_train_acc:
+                    else:
                         acc1 = paddle.static.accuracy(
                             input=prob,
                             label=paddle.reshape(input_field.label, (-1, 1)),
@@ -540,7 +598,7 @@ class Entry(object):
                         dist_optimizer.minimize(loss)
                     else:  # single card training
                         optimizer.minimize(loss)
-                    if "dist" in self.loss_type or self.use_fp16:
+                    if self.model_parallel or self.use_fp16:
                         optimizer = optimizer._optimizer
                 elif use_parallel_test:
                     emb_list = []
@@ -714,9 +772,7 @@ class Entry(object):
             else:
                 state_dict[name] = tensor
 
-        distributed = self.loss_type in ["dist_softmax", "dist_arcface"]
-
-        if for_train or distributed:
+        if for_train or self.model_parallel:
             meta_file = os.path.join(checkpoint_dir, 'meta.json')
             if not os.path.exists(meta_file):
                 logger.error(
@@ -729,7 +785,7 @@ class Entry(object):
                 config = json.load(handle)
 
         # Preporcess distributed parameters.
-        if distributed:
+        if self.model_parallel:
             pretrain_nranks = config['pretrain_nranks']
             assert pretrain_nranks > 0
             emb_dim = config['emb_dim']
@@ -899,8 +955,6 @@ class Entry(object):
             sys.stdout.flush()
 
     def test(self):
-        self._check()
-
         trainer_id = self.trainer_id
         num_trainers = self.num_trainers
 
@@ -979,7 +1033,6 @@ class Entry(object):
         logger.info("test time: {:.4f}".format(test_end - test_start))
 
     def train(self):
-        self._check()
         self.has_run_train = True
 
         trainer_id = self.trainer_id
